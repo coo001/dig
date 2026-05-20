@@ -1,4 +1,4 @@
-import { Crosshair, Gauge, Mountain, Pickaxe, RotateCcw } from "lucide-react";
+import { Crosshair, Gauge, Gem, Mountain, Pickaxe, RotateCcw, Sparkles } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 
@@ -7,13 +7,15 @@ type Block = {
   x: number;
   y: number;
   z: number;
-  kind: "soil" | "stone" | "ore";
+  kind: "soil" | "stone" | "ore" | "crystal";
 };
 
 type GameStats = {
   depth: number;
   blocks: number;
   ore: number;
+  crystals: number;
+  combo: number;
   energy: number;
 };
 
@@ -21,6 +23,7 @@ const WORLD_RADIUS = 7;
 const WORLD_DEPTH = 38;
 const PLAYER_HEIGHT = 1.62;
 const EYE_REACH = 3.6;
+const COMBO_WINDOW_MS = 1450;
 
 function blockKey(x: number, y: number, z: number) {
   return `${x}:${y}:${z}`;
@@ -43,9 +46,10 @@ function makeWorld() {
 
         if (tunnelHint || roughEdge) continue;
 
+        const crystalChance = y < -17 && seededNoise(x + 9, y - 6, z + 11) > 0.986;
         const oreChance = y < -7 && seededNoise(x + 4, y - 11, z + 2) > 0.965;
         const stoneChance = y < -9 && seededNoise(x - 3, y + 8, z - 9) > 0.72;
-        const kind = oreChance ? "ore" : stoneChance ? "stone" : "soil";
+        const kind = crystalChance ? "crystal" : oreChance ? "ore" : stoneChance ? "stone" : "soil";
         const key = blockKey(x, y, z);
         blocks.set(key, { key, x, y, z, kind });
       }
@@ -56,10 +60,35 @@ function makeWorld() {
 }
 
 function blockColor(kind: Block["kind"], y: number) {
+  if (kind === "crystal") return new THREE.Color("#62f0ff").offsetHSL(0, 0.06, y * -0.001);
   if (kind === "ore") return new THREE.Color("#f6c65b");
   if (kind === "stone") return new THREE.Color("#63615d").offsetHSL(0, 0, y * -0.002);
   return new THREE.Color("#8a5a38").offsetHSL(0.02, -0.02, y * -0.003);
 }
+
+function blockLabel(kind: Block["kind"]) {
+  if (kind === "crystal") return "수정 동굴";
+  if (kind === "ore") return "금맥";
+  if (kind === "stone") return "단단한 암반";
+  return "흙";
+}
+
+function nextGoal(stats: GameStats) {
+  if (stats.depth < 8) return "8m까지 내려가 첫 금맥을 찾아보세요";
+  if (stats.ore < 4) return "금맥 4개를 모아 램프를 밝히세요";
+  if (stats.depth < 18) return "18m 아래 수정층까지 길을 뚫으세요";
+  if (stats.crystals < 2) return "수정 2개를 캐면 에너지가 크게 회복됩니다";
+  return "더 깊이 내려가 최고 기록을 갱신하세요";
+}
+
+const initialStats: GameStats = {
+  depth: 0,
+  blocks: 0,
+  ore: 0,
+  crystals: 0,
+  combo: 0,
+  energy: 100,
+};
 
 export function App() {
   const mountRef = useRef<HTMLDivElement | null>(null);
@@ -71,19 +100,23 @@ export function App() {
     group: THREE.Group;
     keys: Set<string>;
     velocity: THREE.Vector3;
+    particles: Array<{
+      mesh: THREE.Mesh;
+      velocity: THREE.Vector3;
+      life: number;
+      maxLife: number;
+    }>;
+    lastMineAt: number;
     yaw: number;
     pitch: number;
     stats: GameStats;
     active: boolean;
   } | null>(null);
-  const [stats, setStats] = useState<GameStats>({
-    depth: 0,
-    blocks: 0,
-    ore: 0,
-    energy: 100,
-  });
+  const [stats, setStats] = useState<GameStats>(initialStats);
   const [isLocked, setIsLocked] = useState(false);
+  const [toast, setToast] = useState("아래로 파고들수록 희귀한 광맥이 나옵니다");
   const [resetSeed, setResetSeed] = useState(0);
+  const goalText = nextGoal(stats);
 
   const materialMap = useMemo(
     () => ({
@@ -94,6 +127,12 @@ export function App() {
         emissive: "#503800",
         emissiveIntensity: 0.18,
         roughness: 0.62,
+      }),
+      crystal: new THREE.MeshStandardMaterial({
+        color: "#62f0ff",
+        emissive: "#0f6a77",
+        emissiveIntensity: 0.42,
+        roughness: 0.38,
       }),
     }),
     [],
@@ -131,10 +170,25 @@ export function App() {
     scene.add(group);
 
     const geometry = new THREE.BoxGeometry(1, 1, 1);
+    const chipGeometry = new THREE.TetrahedronGeometry(0.08, 0);
+    const edgeGeometry = new THREE.EdgesGeometry(geometry);
     const edgesMaterial = new THREE.LineBasicMaterial({ color: "#20150d", transparent: true, opacity: 0.28 });
+    const chipMaterials = {
+      soil: new THREE.MeshStandardMaterial({ color: "#b9784a", roughness: 0.8 }),
+      stone: new THREE.MeshStandardMaterial({ color: "#a6a29a", roughness: 0.8 }),
+      ore: new THREE.MeshStandardMaterial({ color: "#ffd76b", emissive: "#5a3800", emissiveIntensity: 0.35 }),
+      crystal: new THREE.MeshStandardMaterial({ color: "#8af8ff", emissive: "#116b77", emissiveIntensity: 0.65 }),
+    };
     const blocks = makeWorld();
 
     function rebuildVisibleBlocks() {
+      for (const child of group.children) {
+        if (child instanceof THREE.Mesh) {
+          const material = child.material;
+          if (Array.isArray(material)) material.forEach((item) => item.dispose());
+          else material.dispose();
+        }
+      }
       group.clear();
 
       for (const block of blocks.values()) {
@@ -149,7 +203,7 @@ export function App() {
         mesh.userData.key = block.key;
         group.add(mesh);
 
-        const line = new THREE.LineSegments(new THREE.EdgesGeometry(geometry), edgesMaterial);
+        const line = new THREE.LineSegments(edgeGeometry, edgesMaterial);
         line.position.copy(mesh.position);
         group.add(line);
       }
@@ -159,6 +213,7 @@ export function App() {
 
     const keys = new Set<string>();
     const velocity = new THREE.Vector3();
+    const particles: NonNullable<typeof gameRef.current>["particles"] = [];
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2(0, 0);
     const clock = new THREE.Clock();
@@ -171,6 +226,8 @@ export function App() {
       group,
       keys,
       velocity,
+      particles,
+      lastMineAt: 0,
       yaw: 0,
       pitch: 0,
       stats,
@@ -182,6 +239,24 @@ export function App() {
       gameRef.current.stats = next;
       setStats(next);
     };
+
+    function burst(block: Block, origin: THREE.Vector3) {
+      const material = chipMaterials[block.kind];
+      const count = block.kind === "crystal" ? 16 : block.kind === "ore" ? 12 : 8;
+      for (let index = 0; index < count; index += 1) {
+        const mesh = new THREE.Mesh(chipGeometry, material);
+        mesh.position.copy(origin);
+        mesh.castShadow = true;
+        const chipVelocity = new THREE.Vector3(
+          (Math.random() - 0.5) * 3,
+          Math.random() * 2.4 + 0.7,
+          (Math.random() - 0.5) * 3,
+        );
+        const life = block.kind === "soil" ? 0.45 : 0.75;
+        particles.push({ mesh, velocity: chipVelocity, life, maxLife: life });
+        scene.add(mesh);
+      }
+    }
 
     function targetBlock() {
       raycaster.setFromCamera(pointer, camera);
@@ -199,16 +274,32 @@ export function App() {
       if (!block) return;
 
       blocks.delete(key);
+      burst(block, hit.point);
       rebuildVisibleBlocks();
 
       const current = gameRef.current.stats;
-      const energyCost = block.kind === "stone" ? 8 : block.kind === "ore" ? 5 : 3;
-      setGameStats({
+      const now = performance.now();
+      const combo = now - gameRef.current.lastMineAt < COMBO_WINDOW_MS ? Math.min(current.combo + 1, 9) : 1;
+      gameRef.current.lastMineAt = now;
+      const energyCost = block.kind === "stone" ? 8 : block.kind === "ore" ? 5 : block.kind === "crystal" ? 2 : 3;
+      const energyGain = block.kind === "crystal" ? 28 : block.kind === "ore" ? 14 : combo >= 4 ? 3 : 0;
+      const next = {
         depth: Math.max(current.depth, Math.max(0, Math.floor(-camera.position.y + PLAYER_HEIGHT))),
         blocks: current.blocks + 1,
         ore: current.ore + (block.kind === "ore" ? 1 : 0),
-        energy: Math.max(0, Math.min(100, current.energy - energyCost + (block.kind === "ore" ? 14 : 0))),
-      });
+        crystals: current.crystals + (block.kind === "crystal" ? 1 : 0),
+        combo,
+        energy: Math.max(0, Math.min(100, current.energy - energyCost + energyGain)),
+      };
+      setGameStats(next);
+
+      if (block.kind === "ore" || block.kind === "crystal") {
+        setToast(`${blockLabel(block.kind)} 발견! 콤보 x${combo}`);
+      } else if (combo >= 4) {
+        setToast(`빠른 채굴 콤보 x${combo} - 에너지 보너스`);
+      } else {
+        setToast(`${blockLabel(block.kind)} 제거`);
+      }
     }
 
     function isSolidAt(x: number, y: number, z: number) {
@@ -261,8 +352,24 @@ export function App() {
       scene.add(pickLight.target);
 
       const currentDepth = Math.max(0, Math.floor(-camera.position.y + PLAYER_HEIGHT));
-      if (currentDepth !== game.stats.depth) {
-        setGameStats({ ...game.stats, depth: Math.max(game.stats.depth, currentDepth), energy: Math.min(100, game.stats.energy + delta * 1.6) });
+      if (currentDepth > game.stats.depth) {
+        setGameStats({ ...game.stats, depth: currentDepth, energy: Math.min(100, game.stats.energy + delta * 1.6) });
+        if (currentDepth >= 18 && game.stats.depth < 18) setToast("공기가 차가워집니다. 수정층이 가까워요");
+        if (currentDepth >= 8 && game.stats.depth < 8) setToast("벽 사이로 금빛이 보이기 시작합니다");
+      }
+
+      for (let index = particles.length - 1; index >= 0; index -= 1) {
+        const particle = particles[index];
+        particle.life -= delta;
+        particle.velocity.y -= 7.5 * delta;
+        particle.mesh.position.addScaledVector(particle.velocity, delta);
+        particle.mesh.rotation.x += delta * 7;
+        particle.mesh.rotation.y += delta * 9;
+        particle.mesh.scale.setScalar(Math.max(0.05, particle.life / particle.maxLife));
+        if (particle.life <= 0) {
+          scene.remove(particle.mesh);
+          particles.splice(index, 1);
+        }
       }
 
       renderer.render(scene, camera);
@@ -322,14 +429,19 @@ export function App() {
       document.removeEventListener("pointerlockchange", lockChange);
       renderer.domElement.removeEventListener("click", click);
       host.removeChild(renderer.domElement);
+      for (const particle of particles) scene.remove(particle.mesh);
       renderer.dispose();
       geometry.dispose();
+      chipGeometry.dispose();
+      edgeGeometry.dispose();
       edgesMaterial.dispose();
+      Object.values(chipMaterials).forEach((material) => material.dispose());
     };
   }, [materialMap, resetSeed]);
 
   function resetGame() {
-    setStats({ depth: 0, blocks: 0, ore: 0, energy: 100 });
+    setStats(initialStats);
+    setToast("새 갱도가 열렸습니다");
     setResetSeed((value) => value + 1);
   }
 
@@ -341,9 +453,16 @@ export function App() {
           <Pickaxe size={20} />
           <span>DIG</span>
         </div>
-        <button className="icon-button" onClick={resetGame} aria-label="다시 시작">
+        <button className="icon-button" onClick={resetGame} aria-label="다시 시작" title="다시 시작">
           <RotateCcw size={18} />
         </button>
+      </div>
+      <div className="hud goal">
+        <Sparkles size={16} />
+        <span>{goalText}</span>
+      </div>
+      <div className="hud toast" aria-live="polite">
+        {toast}
       </div>
       <div className="hud stats" aria-label="게임 상태">
         <div>
@@ -359,19 +478,22 @@ export function App() {
           <span>{stats.ore}</span>
         </div>
         <div>
+          <Gem size={18} />
+          <span>{stats.crystals}</span>
+        </div>
+        <div>
           <Gauge size={18} />
           <span>{Math.round(stats.energy)}</span>
         </div>
       </div>
+      {stats.combo > 1 && <div className="combo">x{stats.combo}</div>}
       <div className="reticle" aria-hidden="true" />
       {!isLocked && (
         <button className="start" onClick={() => mountRef.current?.querySelector("canvas")?.requestPointerLock()}>
-          클릭해서 파기 시작
+          클릭해서 채굴 시작
         </button>
       )}
-      <div className="controls">
-        WASD 이동 · 마우스 시점 · 클릭 파기 · Space 점프 · Shift 달리기
-      </div>
+      <div className="controls">WASD 이동 · 마우스 시점 · 클릭 채굴 · Space 점프 · Shift 달리기</div>
     </main>
   );
 }
